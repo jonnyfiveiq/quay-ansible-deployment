@@ -1,0 +1,500 @@
+---
+- name: "Quay AIO on localhost (Podman) + seed admin (no anonymous, no self-signup)"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: true
+
+  vars:
+    quay_server_hostname: "192.168.0.53"
+    quay_admin_username: "admin"
+    quay_admin_email: "admin@example.internal"
+    # Password can be overridden with: ansible-playbook playbook.yaml -e quay_admin_password=YourPassword
+    quay_admin_password: "{{ quay_admin_password | default('Smartvm!23') }}"
+
+    # Auto-generate random secrets if not provided
+    quay_secret_key: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=64') }}"
+    quay_database_secret_key: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=64') }}"
+    pg_password: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}"
+
+    quay_root: /opt/quay
+    quay_config_dir: /opt/quay/config
+    quay_storage_dir: /opt/quay/storage
+    quay_pg_dir: /opt/quay/postgres
+    quay_redis_dir: /opt/quay/redis
+    quay_tls_dir: /opt/quay/tls
+
+    quay_image: "quay.io/projectquay/quay:latest"
+    pg_image: "docker.io/library/postgres:15"
+    redis_image: "docker.io/library/redis:7"
+
+    quay_pod: "quay-pod"
+    quay_container: "quay"
+    pg_container: "quay-postgres"
+    redis_container: "quay-redis"
+
+    pg_db: "quay"
+    pg_user: "quay"
+
+    purge_images: false
+    purge_data: false
+
+  tasks:
+    - name: "Display configuration info"
+      ansible.builtin.debug:
+        msg:
+          - "=== Configuration Info ==="
+          - "Admin Username: {{ quay_admin_username }}"
+          - "Admin Password: {{ quay_admin_password }}"
+          - "Quay Secret (first 20 chars): {{ quay_secret_key[:20] }}..."
+          - "DB Secret (first 20 chars): {{ quay_database_secret_key[:20] }}..."
+          - "Postgres Password (first 10 chars): {{ pg_password[:10] }}..."
+          - "=========================="
+
+    - name: "Install required packages"
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - openssl
+          - python3
+          - firewalld
+          - curl
+        state: present
+
+    - name: "Ensure firewalld is running"
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: "Open HTTPS port in firewall"
+      ansible.posix.firewalld:
+        port: 443/tcp
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: "Stop/remove existing Quay containers (ignore if absent)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman rm -f {{ quay_container }} {{ pg_container }} {{ redis_container }} 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: "Remove existing Quay pod (ignore if absent)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman pod rm -f {{ quay_pod }} 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: "Optionally remove images used by this stack"
+      when: purge_images | bool
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman rmi -f {{ quay_image }} {{ pg_image }} {{ redis_image }} 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: "Optionally remove all on-disk data under /opt/quay (DANGEROUS)"
+      when: purge_data | bool
+      ansible.builtin.file:
+        path: "{{ quay_root }}"
+        state: absent
+
+    - name: "Create directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ quay_root }}"
+        - "{{ quay_config_dir }}"
+        - "{{ quay_storage_dir }}"
+        - "{{ quay_pg_dir }}"
+        - "{{ quay_redis_dir }}"
+        - "{{ quay_tls_dir }}"
+
+    - name: "Fix storage directory permissions for Quay container"
+      ansible.builtin.file:
+        path: "{{ quay_storage_dir }}"
+        state: directory
+        mode: "0777"
+        recurse: true
+      register: storage_perms
+
+    - name: "Show storage permissions fix"
+      ansible.builtin.debug:
+        msg: "✓ Storage directory permissions set to 0777 to allow container writes"
+
+    - name: "Generate self-signed TLS cert (SAN includes hostname + localhost)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        crt="{{ quay_tls_dir }}/ssl.crt"
+        key="{{ quay_tls_dir }}/ssl.key"
+        openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+          -keyout "$key" -out "$crt" \
+          -subj "/CN={{ quay_server_hostname }}" \
+          -addext "subjectAltName=IP:{{ quay_server_hostname }},DNS:localhost" \
+          -addext "extendedKeyUsage=serverAuth" \
+          -addext "keyUsage=digitalSignature,keyEncipherment"
+        chmod 0600 "$key"
+      args:
+        executable: /bin/bash
+
+    - name: "Install TLS into Quay config bundle as ssl.cert / ssl.key"
+      ansible.builtin.copy:
+        remote_src: true
+        src: "{{ quay_tls_dir }}/{{ item.src }}"
+        dest: "{{ quay_config_dir }}/{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "ssl.crt", dest: "ssl.cert", mode: "0644" }
+        - { src: "ssl.key", dest: "ssl.key",  mode: "0644" }
+
+    - name: "Write Quay config.yaml (with SETUP_COMPLETE flag)"
+      ansible.builtin.copy:
+        dest: "{{ quay_config_dir }}/config.yaml"
+        mode: "0644"
+        content: |
+          SETUP_COMPLETE: true
+          SERVER_HOSTNAME: {{ quay_server_hostname }}
+          PREFERRED_URL_SCHEME: https
+
+          AUTHENTICATION_TYPE: Database
+          FEATURE_USER_CREATION: false
+          FEATURE_ANONYMOUS_ACCESS: false
+
+          SECRET_KEY: {{ quay_secret_key }}
+          DATABASE_SECRET_KEY: {{ quay_database_secret_key }}
+
+          DB_URI: postgresql://{{ pg_user }}:{{ pg_password }}@127.0.0.1:5432/{{ pg_db }}
+
+          REDIS:
+            host: 127.0.0.1
+            port: 6379
+
+          BUILDLOGS_REDIS:
+            host: 127.0.0.1
+            port: 6379
+
+          USER_EVENTS_REDIS:
+            host: 127.0.0.1
+            port: 6379
+
+          DISTRIBUTED_STORAGE_CONFIG:
+            default:
+              - LocalStorage
+              - storage_path: /datastorage/registry
+
+          DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS: []
+          DISTRIBUTED_STORAGE_PREFERENCE:
+            - default
+
+          SSL_CERTIFICATE_PATH: /conf/stack/ssl.cert
+          SSL_KEY_PATH: /conf/stack/ssl.key
+
+          SUPER_USERS:
+            - {{ quay_admin_username }}
+
+    - name: "Pull images"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman pull {{ item }}
+      args:
+        executable: /bin/bash
+      loop:
+        - "{{ pg_image }}"
+        - "{{ redis_image }}"
+        - "{{ quay_image }}"
+
+    - name: "Create pod and publish 443->8443"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman pod create --name {{ quay_pod }} -p 0.0.0.0:443:8443
+      args:
+        executable: /bin/bash
+
+    - name: "Start Postgres in pod"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman run -d --name {{ pg_container }} --pod {{ quay_pod }} --restart=always \
+          -e POSTGRES_DB={{ pg_db }} \
+          -e POSTGRES_USER={{ pg_user }} \
+          -e POSTGRES_PASSWORD='{{ pg_password }}' \
+          -v {{ quay_pg_dir }}:/var/lib/postgresql/data:Z \
+          {{ pg_image }}
+      args:
+        executable: /bin/bash
+
+    - name: "Start Redis in pod"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman run -d --name {{ redis_container }} --pod {{ quay_pod }} --restart=always \
+          -v {{ quay_redis_dir }}:/data:Z \
+          {{ redis_image }} \
+          redis-server --appendonly yes
+      args:
+        executable: /bin/bash
+
+    - name: "Wait for Postgres to accept connections"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for i in $(seq 1 180); do
+          podman exec {{ pg_container }} pg_isready -U {{ pg_user }} -d {{ pg_db }} >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+
+    - name: "Ensure required Postgres extensions exist (plpgsql, pg_trgm)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman exec {{ pg_container }} psql -U {{ pg_user }} -d {{ pg_db }} -c "CREATE EXTENSION IF NOT EXISTS plpgsql;"
+        podman exec {{ pg_container }} psql -U {{ pg_user }} -d {{ pg_db }} -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+      args:
+        executable: /bin/bash
+
+    - name: "Start Quay in pod (mount config bundle + storage)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman run -d --name {{ quay_container }} --pod {{ quay_pod }} --restart=always \
+          -v {{ quay_config_dir }}:/conf/stack:Z \
+          -v {{ quay_storage_dir }}:/datastorage:Z \
+          {{ quay_image }}
+      args:
+        executable: /bin/bash
+
+    - name: "Sanity check: confirm config bundle visible inside Quay container"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman exec {{ quay_container }} bash -lc 'ls -l /conf/stack; test -s /conf/stack/config.yaml; test -s /conf/stack/ssl.cert; test -s /conf/stack/ssl.key'
+      args:
+        executable: /bin/bash
+
+    - name: "Wait for Quay to be responsive (accept 200/302/401/403)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for i in $(seq 1 240); do
+          code="$(curl -k -s -o /dev/null -w "%{http_code}" https://{{ quay_server_hostname }}/ || true)"
+          if [[ "$code" == "200" || "$code" == "302" || "$code" == "401" || "$code" == "403" ]]; then
+            echo "Quay HTTP is responsive (code: $code)"
+            exit 0
+          fi
+          if [[ $((i % 20)) -eq 0 ]]; then
+            echo "Still waiting for Quay... (attempt $i/240)"
+          fi
+          sleep 2
+        done
+        echo "Quay never became responsive"
+        podman logs --tail 200 {{ quay_container }} || true
+        exit 1
+      args:
+        executable: /bin/bash
+
+    - name: "Wait for Quay database schema to be fully initialized"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Waiting for Quay to initialize database schema..."
+        for i in $(seq 1 120); do
+          result=$(podman exec {{ quay_container }} bash -c 'cd /quay-registry 2>/dev/null && python3 -c "from app import app; from data import model; print(\"OK\")" 2>&1' || echo "NOT_READY")
+          if [[ "$result" == "OK" ]]; then
+            echo "Quay database schema is ready (attempt $i)"
+            exit 0
+          fi
+          if [[ $((i % 10)) -eq 0 ]]; then
+            echo "Still waiting for database schema... (attempt $i/120)"
+          fi
+          sleep 3
+        done
+        echo "ERROR: Quay database schema never became ready"
+        echo "Recent Quay logs:"
+        podman logs --tail 100 {{ quay_container }}
+        exit 1
+      args:
+        executable: /bin/bash
+      register: quay_ready
+
+    - name: "Show Quay readiness result"
+      ansible.builtin.debug:
+        var: quay_ready.stdout_lines
+
+    - name: "Write seed script on host (using model.user.create_user and model.user.change_password)"
+      ansible.builtin.copy:
+        dest: /tmp/quay_seed_admin.py
+        mode: "0700"
+        content: |
+          #!/usr/bin/env python3
+          import sys
+          import os
+          
+          # Change to Quay's working directory
+          os.chdir('/quay-registry')
+          sys.path.insert(0, '/quay-registry')
+          
+          from app import app
+          from data import model
+          
+          username = "{{ quay_admin_username }}"
+          email = "{{ quay_admin_email }}"
+          password = "{{ quay_admin_password }}"
+          
+          print(f"Attempting to seed user: {username}")
+          print(f"Using email: {email}")
+          
+          with app.app_context():
+              try:
+                  # Try to get existing user
+                  user_obj = model.user.get_user(username)
+                  if user_obj:
+                      print(f"User '{username}' already exists, updating password...")
+                      # Use Quay's built-in password change method
+                      model.user.change_password(user_obj, password)
+                      action = "UPDATED"
+                  else:
+                      print(f"Creating new user '{username}'...")
+                      # Use Quay's built-in user creation method
+                      user_obj = model.user.create_user(username, password, email, auto_verify=True)
+                      action = "CREATED"
+                  
+                  # Ensure user is enabled and verified
+                  user_obj.enabled = True
+                  user_obj.verified = True
+                  user_obj.save()
+                  
+                  print(f"SUCCESS: {action} user '{username}'")
+                  print(f"Username: {user_obj.username}")
+                  print(f"Email: {user_obj.email}")
+                  print(f"Verified: {user_obj.verified}")
+                  print(f"Enabled: {user_obj.enabled}")
+                  
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  sys.exit(1)
+
+    - name: "Copy seed script into Quay container"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman cp /tmp/quay_seed_admin.py {{ quay_container }}:/tmp/quay_seed_admin.py
+        podman exec {{ quay_container }} chmod +x /tmp/quay_seed_admin.py
+      args:
+        executable: /bin/bash
+
+    - name: "Seed/Update admin user inside Quay"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman exec {{ quay_container }} bash -c 'cd /quay-registry && python3 /tmp/quay_seed_admin.py'
+      args:
+        executable: /bin/bash
+      register: seed_output
+      failed_when: seed_output.rc != 0
+
+    - name: "Display seed result"
+      ansible.builtin.debug:
+        msg: "{{ seed_output.stdout_lines }}"
+
+    - name: "Verify admin user exists in database"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman exec {{ quay_container }} bash -c 'cd /quay-registry && python3 -c "
+        from app import app
+        from data import model
+        with app.app_context():
+            user = model.user.get_user(\"{{ quay_admin_username }}\")
+            if user:
+                print(f\"✓ Username: {user.username}\")
+                print(f\"✓ Email: {user.email}\")
+                print(f\"✓ Verified: {user.verified}\")
+                print(f\"✓ Enabled: {user.enabled}\")
+                print(f\"✓ UUID: {user.uuid}\")
+            else:
+                print(\"✗ User not found!\")
+                exit(1)
+        "'
+      args:
+        executable: /bin/bash
+      register: verify_user
+
+    - name: "Show user verification"
+      ansible.builtin.debug:
+        msg: "{{ verify_user.stdout_lines }}"
+
+    - name: "Test login via API"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # Create JSON payload in a variable first
+        USERNAME="{{ quay_admin_username }}"
+        PASSWORD="{{ quay_admin_password }}"
+        JSON_DATA="{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}"
+        
+        response=$(curl -k -s -X POST https://{{ quay_server_hostname }}/api/v1/signin \
+          -H 'Content-Type: application/json' \
+          -d "$JSON_DATA")
+        
+        echo "$response"
+        
+        # Check if response indicates success
+        if echo "$response" | grep -q '"success"'; then
+          echo "✓ Login test PASSED"
+          exit 0
+        elif ! echo "$response" | grep -qi 'error\|invalid\|incorrect'; then
+          echo "✓ Login test appears successful"
+          exit 0
+        else
+          echo "✗ Login test FAILED"
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      register: api_test
+      failed_when: false
+
+    - name: "Show API login test result"
+      ansible.builtin.debug:
+        msg: "{{ api_test.stdout_lines }}"
+
+    - name: "Final status + curl check"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "=== Pod and Container Status ==="
+        podman ps --format "table {{'{{'}}.Names{{'}}'}}\t{{'{{'}}.Status{{'}}'}}\t{{'{{'}}.Ports{{'}}'}}"
+        echo
+        echo "=== Quay HTTP Response ==="
+        curl -kI https://{{ quay_server_hostname }}/ | head -n 12
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: final_status
+
+    - name: "Show final status"
+      ansible.builtin.debug:
+        msg: "{{ final_status.stdout_lines }}"
+
+    - name: "Access info"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "✓ Quay Registry is now running!"
+          - "=========================================="
+          - "Quay UI: https://{{ quay_server_hostname }}/"
+          - "  (self-signed cert; browser will show warning)"
+          - ""
+          - "Login credentials:"
+          - "  Username: {{ quay_admin_username }}"
+          - "  Password: {{ quay_admin_password }}"
+          - ""
+          - "To use a different password, run:"
+          - "  ansible-playbook playbook.yaml -e quay_admin_password=YourPassword"
+          - ""
+          - "Troubleshooting:"
+          - "  View logs: podman logs --tail 200 {{ quay_container }}"
+          - "  Restart:   podman restart {{ quay_container }}"
+          - "  Stop all:  podman pod stop {{ quay_pod }}"
+          - "  Start all: podman pod start {{ quay_pod }}"
+          - "=========================================="

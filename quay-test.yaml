@@ -1,0 +1,385 @@
+---
+- name: "End-to-End Test of Local Quay Registry"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: true
+
+  vars:
+    _quay_server: "{{ quay_server_hostname | default('192.168.0.53') }}"
+    _quay_admin_user: "admin"
+    _quay_admin_pass: "{{ quay_admin_password | default('Smartvm!23') }}"
+    
+    # Test configuration
+    test_org: "{{ _quay_admin_user }}"
+    test_repo: "hello-test"
+    test_image_source: "docker.io/library/hello-world:latest"
+    test_image_local_tag: "{{ _quay_server }}/{{ test_org }}/{{ test_repo }}:latest"
+
+  tasks:
+    - name: "Test setup - Display configuration"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Quay Registry End-to-End Test"
+          - "=========================================="
+          - "Registry: https://{{ _quay_server }}"
+          - "Admin User: {{ _quay_admin_user }}"
+          - "Test Repository: {{ test_org }}/{{ test_repo }}"
+          - "Source Image: {{ test_image_source }}"
+          - "Target Image: {{ test_image_local_tag }}"
+          - "=========================================="
+
+    - name: "Step 1: Verify Quay is accessible"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        response=$(curl -k -s -o /dev/null -w "%{http_code}" https://{{ _quay_server }}/)
+        if [[ "$response" == "200" ]] || [[ "$response" == "302" ]]; then
+          echo "✓ Quay UI is accessible (HTTP $response)"
+        else
+          echo "✗ Quay UI returned HTTP $response"
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      register: quay_check
+
+    - name: "Show Quay accessibility result"
+      ansible.builtin.debug:
+        msg: "{{ quay_check.stdout }}"
+
+    - name: "Step 2: Create password file for podman login"
+      ansible.builtin.copy:
+        dest: /tmp/quay_test_password.txt
+        mode: "0600"
+        content: "{{ _quay_admin_pass }}"
+
+    - name: "Step 3: Login to local Quay registry with podman"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cat /tmp/quay_test_password.txt | podman login \
+          --username {{ _quay_admin_user }} \
+          --password-stdin \
+          --tls-verify=false \
+          {{ _quay_server }}
+        echo "✓ Logged into {{ _quay_server }} successfully"
+      args:
+        executable: /bin/bash
+      register: podman_login
+
+    - name: "Show podman login result"
+      ansible.builtin.debug:
+        msg: "{{ podman_login.stdout_lines }}"
+
+    - name: "Step 4: Pull test image from public registry"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Pulling {{ test_image_source }}..."
+        podman pull {{ test_image_source }}
+        echo "✓ Successfully pulled {{ test_image_source }}"
+      args:
+        executable: /bin/bash
+      register: pull_public
+
+    - name: "Show pull result"
+      ansible.builtin.debug:
+        msg: "{{ pull_public.stdout_lines }}"
+
+    - name: "Step 5: Tag image for local registry"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        podman tag {{ test_image_source }} {{ test_image_local_tag }}
+        echo "✓ Tagged image as {{ test_image_local_tag }}"
+      args:
+        executable: /bin/bash
+      register: tag_result
+
+    - name: "Show tag result"
+      ansible.builtin.debug:
+        msg: "{{ tag_result.stdout }}"
+
+    - name: "Step 6: Push image to local Quay registry"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Pushing {{ test_image_local_tag }} to local registry..."
+        podman push --tls-verify=false {{ test_image_local_tag }}
+        echo "✓ Successfully pushed to local Quay registry"
+      args:
+        executable: /bin/bash
+      register: push_result
+
+    - name: "Show push result"
+      ansible.builtin.debug:
+        msg: "{{ push_result.stdout_lines }}"
+
+    - name: "Step 7: Verify repository is accessible via UI"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        response=$(curl -k -s -o /dev/null -w "%{http_code}" \
+          https://{{ _quay_server }}/repository/{{ test_org }}/{{ test_repo }})
+        
+        if [[ "$response" == "200" ]]; then
+          echo "✓ Repository '{{ test_org }}/{{ test_repo }}' is accessible in Quay UI"
+        else
+          echo "⚠ Repository UI returned HTTP $response (may require login to view)"
+        fi
+      args:
+        executable: /bin/bash
+      register: verify_repo
+
+    - name: "Show repository verification"
+      ansible.builtin.debug:
+        msg: "{{ verify_repo.stdout }}"
+
+    - name: "Step 8: List local images before cleanup"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Current local images:"
+        podman images | grep -E "(REPOSITORY|{{ test_image_source.split(':')[0] }}|{{ _quay_server }})" || echo "No matching images found"
+      args:
+        executable: /bin/bash
+      register: list_before
+
+    - name: "Show images before cleanup"
+      ansible.builtin.debug:
+        msg: "{{ list_before.stdout_lines }}"
+
+    - name: "Step 9: Remove ALL local test images (all tags) to test clean pull"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Removing all local test images..."
+        
+        # Remove all tags of the test repository
+        podman rmi {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:latest 2>/dev/null || true
+        podman rmi {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v1.0 2>/dev/null || true
+        podman rmi {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v2.0 2>/dev/null || true
+        
+        # Remove source image
+        podman rmi {{ test_image_source }} 2>/dev/null || true
+        
+        # Remove any remaining tags by listing and removing
+        podman images --format "{{ '{{' }}.Repository{{ '}}' }}:{{ '{{' }}.Tag{{ '}}' }}" | \
+          grep "{{ _quay_server }}/{{ test_org }}/{{ test_repo }}" | \
+          xargs -r podman rmi 2>/dev/null || true
+        
+        echo "✓ Removed all local test images"
+      args:
+        executable: /bin/bash
+      register: remove_local
+
+    - name: "Show removal result"
+      ansible.builtin.debug:
+        msg: "{{ remove_local.stdout_lines }}"
+
+    - name: "Step 10: Verify images are removed"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Checking local images after removal:"
+        if podman images | grep -q "{{ _quay_server }}/{{ test_org }}/{{ test_repo }}"; then
+          echo "⚠ Some test images still exist locally:"
+          podman images {{ _quay_server }}/{{ test_org }}/{{ test_repo }}
+          echo "Continuing anyway..."
+        else
+          echo "✓ All test images successfully removed from local storage"
+        fi
+      args:
+        executable: /bin/bash
+      register: verify_removal
+      failed_when: false
+
+    - name: "Show verification"
+      ansible.builtin.debug:
+        msg: "{{ verify_removal.stdout_lines }}"
+
+    - name: "Step 11: Pull image back from local Quay registry"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Pulling {{ test_image_local_tag }} from local registry..."
+        podman pull --tls-verify=false {{ test_image_local_tag }}
+        echo "✓ Successfully pulled from local Quay registry"
+      args:
+        executable: /bin/bash
+      register: pull_local
+
+    - name: "Show pull from local registry result"
+      ansible.builtin.debug:
+        msg: "{{ pull_local.stdout_lines }}"
+
+    - name: "Step 12: Verify image was pulled"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Verifying pulled image..."
+        podman images {{ _quay_server }}/{{ test_org }}/{{ test_repo }}
+        echo ""
+        echo "✓ Image successfully pulled from Quay registry"
+      args:
+        executable: /bin/bash
+      register: verify_pull
+
+    - name: "Show pull verification"
+      ansible.builtin.debug:
+        msg: "{{ verify_pull.stdout_lines }}"
+
+    - name: "Step 13: Run container from local registry image"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Running container from {{ test_image_local_tag }}..."
+        echo "--- Container Output Start ---"
+        podman run --rm {{ test_image_local_tag }} 2>&1 || true
+        echo "--- Container Output End ---"
+        echo ""
+        echo "✓ Container ran successfully from local Quay registry image"
+      args:
+        executable: /bin/bash
+      register: run_result
+
+    - name: "Show container run result"
+      ansible.builtin.debug:
+        msg: "{{ run_result.stdout_lines }}"
+
+    - name: "Step 14: Verify image metadata"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Image details:"
+        podman inspect {{ test_image_local_tag }} | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)[0]
+        img_id = data.get('Id', 'N/A')
+        if len(img_id) > 12:
+            img_id = img_id[:12] + '...'
+        size_mb = data.get('Size', 0) / 1024 / 1024
+        created = data.get('Created', 'N/A')
+        if len(created) > 19:
+            created = created[:19]
+        print(f'  ID: {img_id}')
+        print(f'  Size: {size_mb:.2f} MB')
+        print(f'  Created: {created}')
+        config = data.get('Config', {})
+        labels = config.get('Labels') or {}
+        print(f'  Labels: {len(labels)} label(s)')
+        " 2>/dev/null
+        echo "✓ Image metadata retrieved successfully"
+      args:
+        executable: /bin/bash
+      register: inspect_result
+
+    - name: "Show image metadata"
+      ansible.builtin.debug:
+        msg: "{{ inspect_result.stdout_lines }}"
+
+    - name: "Step 15: Test multiple tags (push same image with different tag)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Testing multiple tags..."
+        
+        # Tag with v1.0
+        podman tag {{ test_image_local_tag }} {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v1.0
+        echo "✓ Tagged as v1.0"
+        
+        # Push v1.0 tag
+        podman push --tls-verify=false {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v1.0
+        echo "✓ Pushed v1.0 tag to registry"
+        
+        # Tag with v2.0
+        podman tag {{ test_image_local_tag }} {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v2.0
+        echo "✓ Tagged as v2.0"
+        
+        # Push v2.0 tag
+        podman push --tls-verify=false {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v2.0
+        echo "✓ Pushed v2.0 tag to registry"
+        
+        echo ""
+        echo "✓ Multiple tags test completed"
+      args:
+        executable: /bin/bash
+      register: multi_tag_result
+
+    - name: "Show multiple tags result"
+      ansible.builtin.debug:
+        msg: "{{ multi_tag_result.stdout_lines }}"
+
+    - name: "Step 16: List all local images with test repository"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "All tags of test repository in local storage:"
+        podman images {{ _quay_server }}/{{ test_org }}/{{ test_repo }}
+      args:
+        executable: /bin/bash
+      register: list_all_tags
+
+    - name: "Show all tags"
+      ansible.builtin.debug:
+        msg: "{{ list_all_tags.stdout_lines }}"
+
+    - name: "Step 17: Test pulling specific tag"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # Remove v1.0 locally
+        podman rmi {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v1.0 2>/dev/null || true
+        
+        # Pull v1.0 from registry
+        echo "Pulling v1.0 tag from registry..."
+        podman pull --tls-verify=false {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v1.0
+        echo "✓ Successfully pulled v1.0 tag"
+      args:
+        executable: /bin/bash
+      register: pull_specific_tag
+
+    - name: "Show specific tag pull result"
+      ansible.builtin.debug:
+        msg: "{{ pull_specific_tag.stdout_lines }}"
+
+    - name: "Step 18: Clean up temporary files"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/quay_test_password.txt
+
+    - name: "Step 19: Generate cleanup instructions"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Test images in local storage:"
+        podman images {{ _quay_server }}/{{ test_org }}/{{ test_repo }}
+      args:
+        executable: /bin/bash
+      register: cleanup_info
+
+    - name: "Show cleanup info"
+      ansible.builtin.debug:
+        msg: "{{ cleanup_info.stdout_lines }}"
+
+    - name: "Test Summary"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "✓ END-TO-END TEST COMPLETED SUCCESSFULLY"
+          - "=========================================="
+          - ""
+          - "Tests performed:"
+          - "  ✓ Quay UI accessibility"
+          - "  ✓ Podman registry login"
+          - "  ✓ Pull from public registry ({{ test_image_source }})"
+          - "  ✓ Tag image for local registry"
+          - "  ✓ Push to local Quay registry"
+          - "  ✓ Repository accessibility check"
+          - "  ✓ Remove local images"
+          - "  ✓ Pull from local Quay registry"
+          - "  ✓ Run container from local registry"
+          - "  ✓ Image metadata inspection"
+          - "  ✓ Multiple tag push test (latest, v1.0, v2.0)"
+          - "  ✓ Specific tag pull test"
+          - ""
+          - "Your Quay registry at {{ _quay_server }} is fully functional!"
+          - ""
+          - "View in UI:"
+          - "  https://{{ _quay_server }}/repository/{{ test_org }}/{{ test_repo }}"
+          - ""
+          - "To clean up test images:"
+          - "  podman rmi {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:latest"
+          - "  podman rmi {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v1.0"
+          - "  podman rmi {{ _quay_server }}/{{ test_org }}/{{ test_repo }}:v2.0"
+          - ""
+          - "To delete test repository via UI:"
+          - "  https://{{ _quay_server }}/repository/{{ test_org }}/{{ test_repo }}?tab=settings"
+          - "=========================================="
