@@ -4,7 +4,7 @@ Automated deployment and testing of Quay container registry using Ansible and Po
 
 ## Playbooks
 
-### quay-setup-2.yaml
+### quay-setup.yaml
 Deploys an all-in-one Quay registry with:
 - Auto-generated secrets
 - Pre-seeded admin account
@@ -16,16 +16,16 @@ Deploys an all-in-one Quay registry with:
 **Usage:**
 ```bash
 # Default password
-ansible-playbook quay-setup-2.yaml
+ansible-playbook quay-setup.yaml
 
 # Custom password
-ansible-playbook quay-setup-2.yaml -e quay_admin_password='YourPassword'
+ansible-playbook quay-setup.yaml -e quay_admin_password='YourPassword'
 
 # Custom server
-ansible-playbook quay-setup-2.yaml -e quay_server_hostname='10.0.0.100'
+ansible-playbook quay-setup.yaml -e quay_server_hostname='10.0.0.100'
 
 # Clean reinstall
-ansible-playbook quay-setup-2.yaml -e purge_data=true
+ansible-playbook quay-setup.yaml -e purge_data=true
 ```
 
 ### quay-test.yaml
@@ -59,7 +59,7 @@ ansible-playbook quay-test.yaml \
 
 1. Deploy Quay:
 ```bash
-   ansible-playbook quay-setup-2.yaml -e quay_admin_password='MySecurePassword'
+   ansible-playbook quay-setup.yaml -e quay_admin_password='MySecurePassword'
 ```
 
 2. Test deployment:
