@@ -168,6 +168,14 @@
           FEATURE_USER_CREATION: false
           FEATURE_ANONYMOUS_ACCESS: false
 
+          # OCI Artifact Support
+          FEATURE_GENERAL_OCI_SUPPORT: true
+          ALLOWED_OCI_ARTIFACT_TYPES:
+            application/vnd.oci.image.config.v1+json: {}
+            application/vnd.cncf.helm.config.v1+json: {}
+            application/vnd.oci.source.image.config.v1+json: {}
+            application/vnd.unknown.config.v1+json: {}
+
           SECRET_KEY: {{ quay_secret_key }}
           DATABASE_SECRET_KEY: {{ quay_database_secret_key }}
 
