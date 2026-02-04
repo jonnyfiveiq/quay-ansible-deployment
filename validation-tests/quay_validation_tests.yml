@@ -1,0 +1,210 @@
+---
+# Quay Registry Validation Tests for AAP Integration
+# This playbook executes all test cases defined in the Quay Registry Integration Proposal
+# Usage: ansible-playbook quay_validation_tests.yml -e "quay_host=quay.example.com"
+#
+# Run specific test sections with tags:
+#   --tags concurrent    - CO-001 to CO-004
+#   --tags scale         - SC-001 to SC-004
+#   --tags lifecycle     - OL-001 to OL-003
+#   --tags failure       - FR-001 to FR-002
+
+- name: Quay Registry Validation Tests
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+    - vars/test_config.yml
+
+  vars:
+    test_results: []
+    test_start_time: "{{ ansible_date_time.iso8601 }}"
+    report_dir: "{{ playbook_dir }}/reports"
+    test_images_dir: "{{ playbook_dir }}/test-images"
+
+  pre_tasks:
+    - name: Create required directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ report_dir }}"
+        - "{{ test_images_dir }}"
+
+    - name: Verify Quay server is accessible
+      ansible.builtin.uri:
+        url: "https://{{ quay_host }}/api/v1/discovery"
+        method: GET
+        validate_certs: "{{ validate_certs | default(false) }}"
+        status_code: 200
+      register: quay_health
+      failed_when: false
+
+    - name: Fail if Quay is not accessible
+      ansible.builtin.fail:
+        msg: "Cannot reach Quay server at {{ quay_host }}"
+      when: quay_health.status != 200
+
+    - name: Log into Quay registry
+      containers.podman.podman_login:
+        registry: "{{ quay_host }}"
+        username: "{{ quay_username }}"
+        password: "{{ quay_password }}"
+        tlsverify: "{{ validate_certs | default(false) }}"
+
+    - name: Build test images of various sizes
+      ansible.builtin.include_tasks: tasks/build_test_images.yml
+
+  tasks:
+    # =========================================================================
+    # Section 5.3.1 - Concurrent Operation Limits
+    # =========================================================================
+    - name: "CO-001: Concurrent image pulls (identical image)"
+      tags: [concurrent, co001]
+      block:
+        - name: CO-001 - Push test image for pull tests
+          containers.podman.podman_image:
+            name: "{{ quay_host }}/{{ test_namespace }}/test-ee:2gb"
+            push: true
+            tlsverify: "{{ validate_certs | default(false) }}"
+
+        - name: CO-001 - Run concurrent pull tests
+          ansible.builtin.include_tasks: tasks/concurrent_pulls_identical.yml
+          loop: "{{ concurrent_pull_counts }}"
+          loop_control:
+            loop_var: pull_count
+
+    - name: "CO-002: Concurrent image pulls (distinct images)"
+      tags: [concurrent, co002]
+      block:
+        - name: CO-002 - Push distinct test images
+          containers.podman.podman_image:
+            name: "{{ quay_host }}/{{ test_namespace }}/test-ee-{{ item }}:latest"
+            push: true
+            tlsverify: "{{ validate_certs | default(false) }}"
+          loop: "{{ range(1, distinct_image_count + 1) | list }}"
+
+        - name: CO-002 - Run concurrent pull tests for distinct images
+          ansible.builtin.include_tasks: tasks/concurrent_pulls_distinct.yml
+
+    - name: "CO-003: Concurrent image pushes"
+      tags: [concurrent, co003]
+      block:
+        - name: CO-003 - Run concurrent push tests
+          ansible.builtin.include_tasks: tasks/concurrent_pushes.yml
+          loop: "{{ concurrent_push_counts }}"
+          loop_control:
+            loop_var: push_count
+
+    - name: "CO-004: Mixed concurrent operations"
+      tags: [concurrent, co004]
+      block:
+        - name: CO-004 - Run mixed concurrent operations test
+          ansible.builtin.include_tasks: tasks/mixed_concurrent_ops.yml
+
+    # =========================================================================
+    # Section 5.3.2 - Scale and Capacity Limits
+    # =========================================================================
+    - name: "SC-001: Maximum repository count"
+      tags: [scale, sc001]
+      block:
+        - name: SC-001 - Test repository count limits
+          ansible.builtin.include_tasks: tasks/test_repository_count.yml
+          loop: "{{ repository_count_tests }}"
+          loop_control:
+            loop_var: repo_count
+
+    - name: "SC-002: Maximum images per repository"
+      tags: [scale, sc002]
+      block:
+        - name: SC-002 - Test images per repository limits
+          ansible.builtin.include_tasks: tasks/test_images_per_repo.yml
+          loop: "{{ images_per_repo_tests }}"
+          loop_control:
+            loop_var: image_count
+
+    - name: "SC-003: Maximum total image count"
+      tags: [scale, sc003]
+      block:
+        - name: SC-003 - Test total image count limits
+          ansible.builtin.include_tasks: tasks/test_total_images.yml
+          loop: "{{ total_image_count_tests }}"
+          loop_control:
+            loop_var: total_count
+
+    - name: "SC-004: Large image handling"
+      tags: [scale, sc004]
+      block:
+        - name: SC-004 - Test large image push/pull performance
+          ansible.builtin.include_tasks: tasks/test_large_images.yml
+          loop: "{{ large_image_sizes_gb }}"
+          loop_control:
+            loop_var: image_size_gb
+
+    # =========================================================================
+    # Section 5.3.3 - Operational Lifecycle
+    # =========================================================================
+    - name: "OL-001: Garbage collection under load"
+      tags: [lifecycle, ol001]
+      block:
+        - name: OL-001 - Test GC under load
+          ansible.builtin.include_tasks: tasks/test_gc_under_load.yml
+
+    - name: "OL-002: Garbage collection at scale"
+      tags: [lifecycle, ol002]
+      block:
+        - name: OL-002 - Test GC at scale
+          ansible.builtin.include_tasks: tasks/test_gc_at_scale.yml
+
+    - name: "OL-003: Extended operation stability"
+      tags: [lifecycle, ol003]
+      block:
+        - name: OL-003 - Run extended stability test
+          ansible.builtin.include_tasks: tasks/test_extended_stability.yml
+      when: run_extended_tests | default(false)
+
+    # =========================================================================
+    # Section 5.3.4 - Failure and Recovery
+    # =========================================================================
+    - name: "FR-001: Interrupted push recovery"
+      tags: [failure, fr001]
+      block:
+        - name: FR-001 - Test interrupted push recovery
+          ansible.builtin.include_tasks: tasks/test_interrupted_push.yml
+      when: run_failure_tests | default(false)
+
+    - name: "FR-002: Container restart under load"
+      tags: [failure, fr002]
+      block:
+        - name: FR-002 - Test container restart under load
+          ansible.builtin.include_tasks: tasks/test_container_restart.yml
+      when: run_failure_tests | default(false)
+
+  post_tasks:
+    - name: Generate test report
+      ansible.builtin.template:
+        src: templates/test_report.md.j2
+        dest: "{{ report_dir }}/quay_validation_report_{{ ansible_date_time.date }}.md"
+        mode: '0644'
+
+    - name: Generate JSON results
+      ansible.builtin.copy:
+        content: "{{ test_results | to_nice_json }}"
+        dest: "{{ report_dir }}/quay_validation_results_{{ ansible_date_time.date }}.json"
+        mode: '0644'
+
+    - name: Display test summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          Quay Validation Test Summary
+          ========================================
+          Total Tests: {{ test_results | length }}
+          Passed: {{ test_results | selectattr('status', 'equalto', 'PASS') | list | length }}
+          Failed: {{ test_results | selectattr('status', 'equalto', 'FAIL') | list | length }}
+          Report: {{ report_dir }}/quay_validation_report_{{ ansible_date_time.date }}.md
+          ========================================
+
+    - name: Clean up test artifacts
+      ansible.builtin.include_tasks: tasks/cleanup.yml
+      when: cleanup_after_tests | default(true)

@@ -1,0 +1,161 @@
+---
+# Quay Validation Test Configuration
+# Adjust these values to match your test environment and AAP use case requirements
+
+# =============================================================================
+# Quay Server Configuration
+# =============================================================================
+quay_host: "quay.example.com"
+quay_username: "testuser"
+quay_password: "{{ lookup('env', 'QUAY_PASSWORD') }}"
+validate_certs: false
+
+# Test namespace/organization in Quay
+test_namespace: "aap-validation-tests"
+
+# =============================================================================
+# Test Environment Specification (for documentation)
+# =============================================================================
+# Quay Deployment: Single-node containerized (Podman on RHEL 9)
+# Storage Backend: Local filesystem (no object storage)
+# Database: PostgreSQL 15 (shared instance)
+# Cache: Single Redis container
+# Compute Resources: 2 vCPU, 16GB RAM
+# Storage: 500GB local SSD
+
+# =============================================================================
+# Section 5.3.1 - Concurrent Operation Limits
+# =============================================================================
+# CO-001: Concurrent pulls of identical image
+# Realistic for AAP controller clusters (3-5 typical, 10 max for large deployments)
+concurrent_pull_counts:
+  - 5
+  - 10
+  - 20
+
+# CO-002: Concurrent pulls of distinct images
+distinct_image_count: 10
+
+# CO-003: Concurrent push counts
+# Simulates multiple EE build pipelines
+concurrent_push_counts:
+  - 5
+  - 10
+
+# CO-004: Mixed operations configuration
+mixed_ops_config:
+  pulls: 10
+  pushes: 2
+  tag_operations: 5
+
+# =============================================================================
+# Section 5.3.2 - Scale and Capacity Limits
+# =============================================================================
+# SC-001: Repository count tests
+# AAP customers typically have tens of EE images
+repository_count_tests:
+  - 10
+  - 25
+  - 50
+  - 100
+
+# SC-002: Images (tags) per repository tests
+# Hundreds of tags accumulated over time
+images_per_repo_tests:
+  - 50
+  - 100
+  - 200
+  - 500
+
+# SC-003: Total image count tests
+# Tens operational, possibly hundreds over time
+total_image_count_tests:
+  - 50
+  - 100
+  - 500
+  - 1000
+
+# SC-004: Large image sizes to test (in GB)
+# EE images are typically up to 3GB max
+large_image_sizes_gb:
+  - 1
+  - 2
+  - 3
+
+# API response time threshold (seconds)
+api_response_threshold_seconds: 5
+
+# =============================================================================
+# Section 5.3.3 - Operational Lifecycle
+# =============================================================================
+# OL-001: GC under load configuration
+gc_load_test_config:
+  images_to_create: 50
+  images_to_delete: 25
+  concurrent_operations_during_gc: 10
+
+# OL-002: GC at scale configuration
+gc_scale_test_config:
+  images_to_create: 200
+  images_to_delete: 150
+  wait_for_gc_minutes: 30
+
+# OL-003: Extended stability test duration (hours)
+# Default 48 hours as per test spec, but can be reduced for quick validation
+extended_stability_duration_hours: 48
+extended_stability_ops_per_minute: 10
+
+# =============================================================================
+# Section 5.3.4 - Failure and Recovery
+# =============================================================================
+# FR-001/FR-002: Requires access to Quay container host
+quay_container_host: "{{ quay_host }}"
+quay_container_name: "quay"
+quay_container_user: "root"
+
+# =============================================================================
+# Test Execution Options
+# =============================================================================
+# Run extended tests (OL-003: 48-hour test)
+run_extended_tests: false
+
+# Run failure/recovery tests (requires container host access)
+run_failure_tests: false
+
+# Clean up test artifacts after completion
+cleanup_after_tests: true
+
+# Number of parallel async tasks
+max_async_tasks: 50
+
+# Async task polling interval (seconds)
+async_poll_interval: 5
+
+# =============================================================================
+# Test Image Configuration
+# =============================================================================
+# Base image to use for building test EE images
+base_test_image: "registry.access.redhat.com/ubi9/ubi-minimal:latest"
+
+# Padding file sizes for creating images of specific sizes
+# These are approximate - actual image size includes base layers
+test_image_padding:
+  1gb: 1073741824
+  2gb: 2147483648
+  3gb: 3221225472
+
+# =============================================================================
+# Success Criteria Thresholds
+# =============================================================================
+thresholds:
+  # CO-001: Maximum acceptable failure rate for concurrent pulls
+  concurrent_pull_failure_rate: 0.05  # 5%
+  
+  # SC-001: Maximum acceptable API response time (seconds)
+  api_response_time: 5
+  
+  # SC-004: Minimum acceptable throughput (MB/s)
+  min_throughput_mbps: 50
+  
+  # OL-003: Maximum acceptable memory growth (%)
+  max_memory_growth_percent: 10
